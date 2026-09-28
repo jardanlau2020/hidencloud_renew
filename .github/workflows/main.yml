@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     # - name: Install Cloudflare WARP
     #   uses: fscarmen/warp-on-actions@v1.4
@@ -24,7 +24,7 @@ jobs:
     #     stack: ipv4
 
     - name: Setup Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.10'
         cache: 'pip'
