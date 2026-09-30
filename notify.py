@@ -107,6 +107,68 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+# ================= 通知排版 helper（fleet 統一瘦身格式） =================
+def now_local() -> str:
+    """UTC+8 當地時間 MM-DD HH:MM（GitHub runner 係 UTC）"""
+    return time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+
+
+def clip_text(text: object, limit: int = 60) -> str:
+    """壓平換行／多餘空白並截短，超出用 … 收尾"""
+    cleaned = " ".join(str(text or "").split())
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 1] + "…"
+
+
+def fmt_expiry(value: object) -> str:
+    """到期時間（timestamp 秒／毫秒 或 ISO／日期字串）→ MM-DD HH:MM 或 MM-DD"""
+    if value in (None, "", 0):
+        return ""
+    try:
+        number = float(value)
+        if number > 1e11:
+            number /= 1000.0
+        if number > 1e9:
+            return time.strftime("%m-%d %H:%M", time.gmtime(number + 8 * 3600))
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", text)
+    if match:
+        return f"{match.group(2)}-{match.group(3)} {match.group(4)}:{match.group(5)}"
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        return f"{match.group(2)}-{match.group(3)}"
+    return text[:19]
+
+
+def build_summary(service_name: str, items: list[dict]) -> str:
+    """瘦身版通知：統計一行 + 每項一行（純文字，唔加任何標記）
+
+    items: [{"name": 帳號／伺服器, "status": ok|skip|bad|dry,
+             "detail": 短原因, "expire": 到期時間}]
+    """
+    n_ok = sum(1 for item in items if item.get("status") in ("ok", "done"))
+    n_skip = sum(1 for item in items if item.get("status") == "skip")
+    n_bad = sum(1 for item in items if item.get("status") == "bad")
+    lines = [f"🎮 {service_name} ｜ {now_local()} ｜ ✅ {n_ok} ｜ ⏭️ {n_skip} ｜ ❌ {n_bad}"]
+    for item in items:
+        bits = ["▪️ " + str(item.get("name") or "?")]
+        status = item.get("status")
+        expire = fmt_expiry(item.get("expire"))
+        if status in ("ok", "done"):
+            bits.append("✅ 已續期" + (f" → {expire}" if expire else ""))
+        elif status == "skip":
+            bits.append("⏭️ " + (item.get("detail") or "未可續") + (f" · 到期 {expire}" if expire else ""))
+        elif status == "dry":
+            bits.append("🧪 dry-run" + (f" · 到期 {expire}" if expire else ""))
+        else:
+            bits.append("❌ " + clip_text(item.get("detail") or "失敗"))
+        lines.append(" · ".join(bits))
+    if n_bad:
+        lines.append("⚠️ 睇 workflow log 排查")
+    return "\n".join(lines)
+
+
 def normalize_channel(channel: str | None) -> str:
     if channel is None:
         return "wxPusherBot"
@@ -346,7 +408,8 @@ def send_telegram(title: str, content: str) -> bool:
         headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
         params={
             "chat_id": _env_first("TG_CHAT_ID", "TG_USER_ID"),
-            "text": f"{title}\n\n{content}",
+            # 表頭同內容之間唔留空行（通知瘦身）
+            "text": f"{title}\n{content}",
             "disable_web_page_preview": "true",
         },
         proxies=proxies,

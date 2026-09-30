@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import time
 import unittest
 import importlib
 from unittest.mock import Mock, patch
@@ -48,6 +49,7 @@ class NotifyRoutingTests(unittest.TestCase):
             main_module = importlib.import_module("main")
             main_module = importlib.reload(main_module)
         self.assertIs(main_module.send_notify, notify.send_notify)
+        self.assertIs(main_module.build_summary, notify.build_summary)
 
     def test_all_official_channels_have_senders(self):
         self.assertEqual(set(notify.SENDERS), notify.OFFICIAL_CHANNELS)
@@ -82,7 +84,7 @@ class NotifyRoutingTests(unittest.TestCase):
         self.assertTrue(ok)
         _, kwargs = mock_post.call_args
         self.assertEqual(kwargs["params"]["chat_id"], "999999")
-        self.assertEqual(kwargs["params"]["text"], "标题\n\n内容")
+        self.assertEqual(kwargs["params"]["text"], "标题\n内容")
 
     @patch("notify.requests.post")
     def test_dingtalk_uses_utf8_json(self, mock_post):
@@ -227,6 +229,85 @@ class NotifyRoutingTests(unittest.TestCase):
         smtp_instance.sendmail.assert_called_once()
         args = smtp_instance.sendmail.call_args[0]
         self.assertEqual(args[0], "bot@example.com")
+
+
+class SummaryFormatTests(unittest.TestCase):
+    """通知瘦身格式：統計一行 + 每項一行（冇空行／冇分隔線／冇水印）"""
+
+    def setUp(self):
+        patcher = patch("notify.now_local", return_value="09-30 12:00")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_all_success_is_two_lines(self):
+        text = notify.build_summary("HidenCloud 續期", [
+            {"name": "帳號 1 服務 147008", "status": "ok"},
+        ])
+        self.assertEqual(
+            text,
+            "🎮 HidenCloud 續期 ｜ 09-30 12:00 ｜ ✅ 1 ｜ ⏭️ 0 ｜ ❌ 0\n"
+            "▪️ 帳號 1 服務 147008 · ✅ 已續期",
+        )
+
+    def test_success_with_expiry_shows_new_expiry(self):
+        text = notify.build_summary("HidenCloud 續期", [
+            {"name": "帳號 1 服務 147008", "status": "ok", "expire": "2026-10-12T08:00:00"},
+        ])
+        self.assertEqual(
+            text.splitlines()[1],
+            "▪️ 帳號 1 服務 147008 · ✅ 已續期 → 10-12 08:00",
+        )
+
+    def test_all_skipped_keeps_reason(self):
+        text = notify.build_summary("HidenCloud 續期", [
+            {"name": "帳號 1 服務 147008", "status": "skip", "detail": "未可續（未到窗口，剩 3 天）"},
+            {"name": "帳號 2 服務 147009", "status": "skip", "detail": "未可續（未到窗口，剩 5 天）"},
+        ])
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "🎮 HidenCloud 續期 ｜ 09-30 12:00 ｜ ✅ 0 ｜ ⏭️ 2 ｜ ❌ 0")
+        self.assertEqual(lines[1], "▪️ 帳號 1 服務 147008 · ⏭️ 未可續（未到窗口，剩 3 天）")
+        self.assertEqual(lines[2], "▪️ 帳號 2 服務 147009 · ⏭️ 未可續（未到窗口，剩 5 天）")
+        self.assertEqual(len(lines), 3)
+
+    def test_failure_adds_hint_line_and_truncates_reason(self):
+        text = notify.build_summary("HidenCloud 續期", [
+            {"name": "帳號 1 服務 147008", "status": "ok"},
+            {"name": "帳號 2 服務 147009", "status": "bad", "detail": "處理異常：" + "x" * 80},
+        ])
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "🎮 HidenCloud 續期 ｜ 09-30 12:00 ｜ ✅ 1 ｜ ⏭️ 0 ｜ ❌ 1")
+        self.assertTrue(lines[2].startswith("▪️ 帳號 2 服務 147009 · ❌ 處理異常：xxxx"))
+        self.assertLessEqual(len(lines[2]), len("▪️ 帳號 2 服務 147009 · ❌ ") + 60)
+        self.assertEqual(lines[-1], "⚠️ 睇 workflow log 排查")
+
+    def test_dry_run_and_no_blank_lines(self):
+        text = notify.build_summary("HidenCloud 續期", [
+            {"name": "帳號 1 服務 147008", "status": "dry", "expire": "2026-10-12"},
+        ])
+        self.assertNotIn("\n\n", text)
+        self.assertNotIn("───", text)
+        self.assertEqual(text.splitlines()[1], "▪️ 帳號 1 服務 147008 · 🧪 dry-run · 到期 10-12")
+
+class SummaryHelperTests(unittest.TestCase):
+    """排版 helper（唔 patch now_local，順便驗真時間）"""
+
+    def test_clip_text_flattens_and_truncates(self):
+        self.assertEqual(notify.clip_text("  多行\n內容\t測試 "), "多行 內容 測試")
+        self.assertEqual(notify.clip_text("abcdef", 4), "abc…")
+        self.assertEqual(notify.clip_text(None), "")
+
+    def test_fmt_expiry_variants(self):
+        self.assertEqual(notify.fmt_expiry(None), "")
+        self.assertEqual(notify.fmt_expiry(""), "")
+        self.assertEqual(notify.fmt_expiry("2026-10-12T08:30:00"), "10-12 08:30")
+        self.assertEqual(notify.fmt_expiry("2026-10-12"), "10-12")
+        self.assertEqual(notify.fmt_expiry(1760000000), "10-09 16:53")  # 秒（UTC+8）
+        self.assertEqual(notify.fmt_expiry(1760000000000), "10-09 16:53")  # 毫秒
+
+    def test_now_local_is_utc8_mm_dd_hh_mm(self):
+        expected = time.strftime("%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+        self.assertRegex(notify.now_local(), r"^\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual(notify.now_local(), expected)
 
 
 if __name__ == "__main__":

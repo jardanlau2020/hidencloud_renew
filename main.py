@@ -12,7 +12,7 @@ import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, unquote
-from notify import send_notify
+from notify import build_summary, send_notify
 try:
     from cookie_context import normalize_cookie_records, parse_seed_cookie_string, success_path_label
 except ModuleNotFoundError:
@@ -166,6 +166,10 @@ class WebDavManager:
 def sleep_random(min_ms=3000, max_ms=8000):
     sec = random.randint(min_ms, max_ms) / 1000.0
     time.sleep(sec)
+
+def service_result(status, detail=""):
+    """單個服務嘅通知結果（status: ok / skip / bad），餵畀 notify.build_summary。"""
+    return {"status": status, "detail": detail}
 
 class CacheManager:
     @staticmethod
@@ -647,13 +651,13 @@ class HidenCloudBot:
                         threshold_text = "1 day" if threshold == 1 else f"{threshold} days"
                         kind = "免费服务" if is_free else "服务"
                         self.log(f"⏳ 暂未到达续期时间: {kind}剩余时间低于 {threshold_text} 才可续期。当前剩余: {days_until} 天。")
-                        return
+                        return service_result('skip', f"未可續（未到窗口，剩 {days_until} 天）")
 
             # ================== 4. 执行单次精准续期 ==================
             token_input = soup.find('input', attrs={'name': '_token'})
             if not token_input:
                 self.log("❌ 无法找到续期 Token (可能是服务已到期或页面结构变更)")
-                return
+                return service_result('bad', "搵唔到續期 Token（可能已到期或頁面改版）")
 
             self.log(f"提交续期 ({RENEW_DAYS}天)...")
             sleep_random(1000, 2000)
@@ -676,22 +680,31 @@ class HidenCloudBot:
 
             if handled and outcome in {'invoice_page', 'invoice_link', 'invoice_poll'}:
                 self.log(f"[RENEW_RESULT] {success_path_label(submit_stage, rebuild_retry=rebuild_retry)}")
+                outcome_result = service_result('ok')
             elif handled and outcome == 'server_reject':
                 self.log(f"[RENEW_RESULT] {'重建会话后' if rebuild_retry else '当前会话'}提交已被服务端拒绝")
+                outcome_result = service_result('bad', "續期請求被服務端拒絕")
+            else:
+                outcome_result = None
 
             if not handled and allow_rebuild_retry and res.status_code == 419:
                 self.log("♻️ 当前会话内续期仍失败，模拟重跑 Job：重建会话后完整重试当前服务一次...")
                 if self.rebuild_session_and_reinit():
-                    self.process_service(service, allow_rebuild_retry=False, skip_initial_delay=True, rebuild_retry=True)
+                    return self.process_service(service, allow_rebuild_retry=False, skip_initial_delay=True, rebuild_retry=True)
                 else:
                     self.log("❌ 重建会话后仍无法重新登录，放弃本服务本轮续期")
                     self.mark_retry_needed(f"服务 {service['id']} 重建会话后仍无法完成续期")
+                    return service_result('bad', "重建會話後仍無法登入")
             elif not handled:
                 self.mark_retry_needed(f"服务 {service['id']} 本轮续期未完成")
+                return service_result('bad', "本輪續期未完成")
+
+            return outcome_result or service_result('bad', "本輪續期未完成")
 
         except Exception as e:
             self.log(f"处理异常: {e}")
             self.mark_retry_needed(f"服务 {service['id']} 处理异常")
+            return service_result('bad', f"處理異常：{e}")
         finally:
             # 每处理完一个服务保存一次 Cookie，而非每次请求都上传
             self.save_cookies(upload=True)
@@ -842,20 +855,30 @@ if __name__ == '__main__':
 
     log_print(f"\n=== HidenCloud 续期脚本启动 (Python版) ===")
 
+    summary_items = []
     for i, cookie in enumerate(cookies_list):
         bot = HidenCloudBot(cookie, i)
+        account_label = f"帳號 {bot.index}"
         success = bot.init()
 
         if not success:
             bot.reset_to_env(cookie)
             success = bot.init()
 
-        if success:
+        if success and bot.services:
             for service in bot.services:
-                bot.process_service(service)
+                result = bot.process_service(service) or service_result('bad', "本輪續期未完成")
+                summary_items.append({
+                    "name": f"{account_label} 服務 {service['id']}",
+                    "status": result["status"],
+                    "detail": result["detail"],
+                })
+        elif success:
+            summary_items.append({"name": account_label, "status": "skip", "detail": "未可續（冇服務）"})
         else:
             log_print(f"账号 {i + 1}: 登录失败，请检查 Cookie")
             bot.mark_retry_needed("账号初始化失败")
+            summary_items.append({"name": account_label, "status": "bad", "detail": "登入失敗，Cookie 失效"})
 
         if bot.retry_needed:
             any_retry_needed = True
@@ -864,9 +887,11 @@ if __name__ == '__main__':
         if i < len(cookies_list) - 1:
             sleep_random(5000, 10000)
 
-    final_content = "\n".join(ALL_LOGS)
-    if final_content:
-        send_notify("HidenCloud 续期报告", final_content)
+    # 通知瘦身：表頭一行當 title，每項一行當 content（TG 砌成 title\ncontent，冇空行）
+    if summary_items:
+        summary = build_summary("HidenCloud 續期", summary_items)
+        headline, _, body = summary.partition("\n")
+        send_notify(headline, body)
 
     if any_retry_needed:
         log_print("🔁 本轮存在可重试失败，脚本将返回退出码 1，供 GitHub Actions 延时再跑一次")
