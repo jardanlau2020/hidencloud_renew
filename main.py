@@ -628,6 +628,50 @@ class HidenCloudBot:
         self.mark_retry_needed(f"瀏覽器續期未完成（服務 {service_id}）")
         return service_result('bad', detail or '瀏覽器續期未完成')
 
+    def renew_all_via_browser(self):
+        """browser 模式：唔靠 HTTP 層 session，browser 自己開 session + 發現服務 + 逐個續期。
+
+        2026-10-05 實測：HTTP cookie 壽命可能只得幾十分鐘，如果仲要先過
+        `bot.init()`，cookie 一死就連瀏覽器都開唔到（run 37265302879 就係咁死）。
+        所以呢條路徑刻意唔 gate 喺 HTTP 登入上。
+        """
+        try:
+            import hc_browser
+        except ImportError as e:
+            self.log(f"❌ 載入 hc_browser 失敗: {e}")
+            return [{'id': '?', 'status': 'bad', 'detail': f'hc_browser 模組缺失：{e}'}]
+
+        cookies = hc_browser.cookie_records_from_jar(self.session.cookies)
+        email = (os.environ.get('HC_EMAIL') or '').strip()
+        password = (os.environ.get('HC_PASSWORD') or '').strip()
+        self.log(f"🖥️ browser 模式：{len(cookies)} 個 cookie"
+                 f"{' ＋帳密後備' if email and password else '（冇帳密後備）'}")
+
+        known = [s['id'] for s in self.services]
+        out = hc_browser.renew_account_via_browser(
+            known, cookies, email, password, shot_prefix=f"hc_a{self.index}")
+        for path in out.get('shots', []):
+            self.log(f"🖼️ {path}")
+
+        items = []
+        for svc in out.get('services', []):
+            sid = svc.get('id', '?')
+            detail = svc.get('detail', '')
+            if svc.get('status') == 'ok':
+                self.log(f"✅ 服務 {sid} 續期成功：{detail}")
+            elif svc.get('status') == 'skip':
+                self.log(f"⏳ 服務 {sid}：{detail}")
+            else:
+                self.log(f"❌ 服務 {sid}：{detail}")
+                self.last_reject = detail
+                self.mark_retry_needed(f'瀏覽器續期未完成（服務 {sid}）')
+            items.append({'id': sid, 'status': svc.get('status', 'bad'), 'detail': detail})
+
+        if not items:
+            self.mark_retry_needed('瀏覽器模式冇服務可處理')
+            items = [{'id': '?', 'status': 'bad', 'detail': '瀏覽器模式冇服務可處理'}]
+        return items
+
     def submit_renew_request(self, service_id, soup, referer_url):
         form, action_url = self.find_renew_form(soup, service_id)
         payload = self.extract_form_payload(form) if form else {}
@@ -987,6 +1031,27 @@ if __name__ == '__main__':
     for i, cookie in enumerate(cookies_list):
         bot = HidenCloudBot(cookie, i)
         account_label = f"帳號 {bot.index}"
+
+        # ================= browser 模式：唔 gate 喺 HTTP 層 session =================
+        if HC_MODE == 'browser':
+            try:
+                bot.init()          # 純 best-effort：拎到服務清單就更好，拎唔到都繼續
+            except Exception as e:
+                bot.log(f"ℹ️ HTTP 層探唔到服務清單（唔阻瀏覽器路徑）: {e}")
+            if bot.services:
+                bot.log(f"ℹ️ HTTP 層列出 {len(bot.services)} 個服務: "
+                        f"{[s['id'] for s in bot.services]}")
+            for item in bot.renew_all_via_browser():
+                summary_items.append({
+                    "name": f"{account_label} 服務 {item['id']}",
+                    "status": item['status'],
+                    "detail": item['detail'],
+                })
+            if bot.retry_needed:
+                any_retry_needed = True
+            log_print("\n----------------------------------------\n")
+            continue
+
         success = bot.init()
 
         if not success:

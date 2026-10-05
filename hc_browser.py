@@ -513,12 +513,30 @@ def _server_error_text(page):
 
 # ============================ 主流程 ============================
 
-def renew_via_browser(service_id, cookies, shot_prefix='hc', timeout_minutes_hint=None):
-    """用真瀏覽器完成一次續期。
+def discover_service_ids(page, shot_prefix='hc'):
+    """由 dashboard HTML 抽服務 ID（HTTP cookie 死咗都唔影響，browser 自己睇）"""
+    try:
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8,
+                        shot_on_timeout=f"{shot_prefix}_discover.png")
+        html = page.content()
+        ids = []
+        for sid in re.findall(r'/service/(\d+)/manage', html):
+            if sid not in ids:
+                ids.append(sid)
+        if not ids:
+            for sid in re.findall(r'#(\d{4,})', html):
+                if sid not in ids:
+                    ids.append(sid)
+        log(f"🔎 瀏覽器發現服務: {ids or '（冇）'}")
+        return ids
+    except Exception as e:
+        log(f"❌ 發現服務失敗: {e}")
+        return []
 
-    返回 dict：status('ok'/'skip'/'bad')、detail、due_before、due_after
-    """
-    sync_playwright = _sync_playwright()
+
+def _renew_one_in_session(page, service_id, shot_prefix='hc'):
+    """已登入狀態下續期單一服務。返 dict：status/detail/due_before/due_after/shots"""
     service_url = f"{BASE_URL}/service/{service_id}/manage"
     shots = []
 
@@ -538,6 +556,163 @@ def renew_via_browser(service_id, cookies, shot_prefix='hc', timeout_minutes_hin
                         shot_on_timeout=f"{shot_prefix}_guard.png")
         return page
 
+    try:
+        log(f"➡ 前往服務頁 {service_url}")
+        page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
+        solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8,
+                        shot_on_timeout=f"{shot_prefix}_entry.png")
+
+        if '/auth/login' in page.url or '/login' in page.url:
+            shot("login_required")
+            return {'status': 'bad', 'detail': '被踢去登入頁（會話失效）',
+                    'due_before': '', 'due_after': '', 'shots': shots}
+
+        due_before = get_due_date(page)
+        log(f"📆 續期前到期: {due_before or '（抽唔到）'}")
+
+        # ---- 撳 Renew 打開 modal ----
+        log("🖱️ 準備點擊 Renew…")
+        renew_btn = page.locator('button[onclick*="showRenewAlert"], button:has-text("Renew")').first
+        create_btn = page.locator('button:has-text("Create Invoice")')
+
+        modal_opened = False
+        for i in range(6):
+            try:
+                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.scroll_into_view_if_needed(timeout=5000)
+                log(f"🖱️ 第 {i + 1} 次點擊 Renew...")
+                renew_btn.click(timeout=10000)
+
+                time.sleep(2)
+                page_text = page.locator("body").inner_text(timeout=10000)
+                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+                    shot("renew_not_allowed")
+                    return {'status': 'skip', 'detail': '未到續期窗口',
+                            'due_before': due_before, 'due_after': due_before, 'shots': shots}
+                err = _server_error_text(page)
+                if err:
+                    shot("server_reject")
+                    return {'status': 'bad', 'detail': err,
+                            'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
+                try:
+                    create_btn.wait_for(state="visible", timeout=5000)
+                    modal_opened = True
+                    log("✅ modal 已彈出（見 Create Invoice）")
+                    break
+                except Exception:
+                    # modal 可能先出 Turnstile，Create Invoice 稍後先出現
+                    if challenge_boxes(page):
+                        modal_opened = True
+                        log("✅ modal 已彈出（先出 Turnstile）")
+                        break
+                    log("⚠️ modal 未出現，準備重試…")
+                    time.sleep(2)
+            except Exception as e:
+                log(f"❌ 點擊 Renew 出錯: {e}")
+
+        if not modal_opened:
+            shot("modal_failed")
+            return {'status': 'bad', 'detail': '撳 Renew 後 modal 彈唔出',
+                    'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
+        # ---- modal 內 Turnstile ----
+        log("🛡️ 處理 modal 內 Turnstile…")
+        if not solve_turnstile(page, timeout=120, require_positive=True,
+                               shot_on_timeout=f"{shot_prefix}_modal_ts.png"):
+            log("⚠️ modal Turnstile 未確認通過，嘗試照樣撳 Create Invoice…")
+
+        try:
+            create_btn.wait_for(state="visible", timeout=30000)
+        except Exception:
+            pass
+
+        create_clicked = False
+        for i in range(3):
+            try:
+                log(f"🖱️ 點擊 Create Invoice（第 {i + 1} 次）...")
+                create_btn.click(timeout=10000)
+                create_clicked = True
+                break
+            except Exception as e:
+                log(f"⚠️ Create Invoice 點擊失敗: {e}")
+                solve_turnstile(page, timeout=40, require_positive=True)
+
+        if not create_clicked:
+            shot("create_invoice_failed")
+            return {'status': 'bad', 'detail': '撳唔到 Create Invoice',
+                    'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
+        # ---- 等跳落 invoice 頁 ----
+        invoice_url = None
+        t0 = time.time()
+        while time.time() - t0 < 120:
+            if '/invoice/' in page.url or '/payment/' in page.url:
+                invoice_url = page.url
+                log(f"🎉 已跳落: {invoice_url}")
+                break
+            if page.locator(f'iframe[src*="{TURNSTILE_FRAME_URL_MARKER}"]').count() > 0:
+                solve_turnstile(page, timeout=45, reload_after=8)
+            time.sleep(1)
+
+        if not invoice_url:
+            shot("stuck_invoice")
+            err = _server_error_text(page)
+            return {'status': 'bad',
+                    'detail': err or '撳完 Create Invoice 但冇跳落發票頁',
+                    'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
+        # ---- 發票頁撳 Pay ----
+        refresh_manage()
+        if page.url != invoice_url:
+            page.goto(invoice_url, wait_until="domcontentloaded", timeout=60000)
+        solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8,
+                        shot_on_timeout=f"{shot_prefix}_invoice_ts.png")
+
+        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        try:
+            pay_btn.wait_for(state="visible", timeout=30000)
+            pay_btn.click(timeout=15000)
+            log("✅ 已點擊 Pay")
+        except Exception as e:
+            log(f"⚠️ 搵唔到 Pay 掣: {e}")
+            shot("no_pay_button")
+            return {'status': 'bad', 'detail': '發票頁搵唔到 Pay 掣',
+                    'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
+        time.sleep(6)
+        solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
+
+        # ---- 返去睇新到期日 ----
+        refresh_manage()
+        due_after = get_due_date(page)
+        log(f"📆 續期後到期: {due_after or '（抽唔到）'}")
+
+        if due_before and due_after and due_before != due_after:
+            log("✅ 續期確認：到期日已推後")
+            return {'status': 'ok', 'detail': f'續期成功（{due_before} → {due_after}）',
+                    'due_before': due_before, 'due_after': due_after, 'shots': shots}
+
+        shot("after_pay")
+        return {'status': 'bad', 'detail': f'付咗但到期日冇變（{due_before or "?"} → {due_after or "?"}）',
+                'due_before': due_before, 'due_after': due_after, 'shots': shots}
+
+    except Exception as e:
+        log(f"❌ 續期流程異常: {e}")
+        shot("exception")
+        return {'status': 'bad', 'detail': f'續期流程異常：{e}',
+                'due_before': '', 'due_after': '', 'shots': shots}
+
+
+def renew_account_via_browser(service_ids, cookies, email='', password='', shot_prefix='hc'):
+    """開一次瀏覽器處理成個帳號：建 session →（冇 service_ids 就自己發現）→ 逐個續期。
+
+    重點：唔靠 HTTP 層（bot.init()）——cookie 死咗都仲有出路。
+    """
+    sync_playwright = _sync_playwright()
+    results = []
+    all_shots = []
+
     with sync_playwright() as p:
         browser = None
         page = None
@@ -553,168 +728,62 @@ def renew_via_browser(service_id, cookies, shot_prefix='hc', timeout_minutes_hin
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
 
-            # 會話：cookie 先行，死咗就退帳密登入（HC_EMAIL / HC_PASSWORD）
-            email = (os.environ.get('HC_EMAIL') or '').strip()
-            password = (os.environ.get('HC_PASSWORD') or '').strip()
             if not ensure_session(page, cookies, email, password):
                 try:
-                    page.screenshot(path=f"{shot_prefix}_login_fail.png")
-                    shots.append(f"{shot_prefix}_login_fail.png")
+                    path = f"{shot_prefix}_login_fail.png"
+                    page.screenshot(path=path)
+                    all_shots.append(path)
+                    log(f"📸 截圖: {path}")
                 except Exception:
                     pass
-                return {'status': 'bad',
-                        'detail': '登入唔到（cookie 失效且冇可用帳密）',
-                        'due_before': '', 'due_after': '', 'shots': shots}
+                return {'services': [{'id': sid or '?', 'status': 'bad',
+                                      'detail': '登入唔到（cookie 失效且冇可用帳密）',
+                                      'due_before': '', 'due_after': ''} for sid in (service_ids or ['?'])],
+                        'shots': all_shots}
 
-            log(f"➡ 前往服務頁 {service_url}")
-            page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
-            solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8,
-                            shot_on_timeout=f"{shot_prefix}_entry.png")
+            ids = list(service_ids or [])
+            if not ids:
+                ids = discover_service_ids(page, shot_prefix)
+            if not ids:
+                return {'services': [{'id': '?', 'status': 'bad',
+                                      'detail': '搵唔到任何服務',
+                                      'due_before': '', 'due_after': ''}],
+                        'shots': all_shots}
 
-            if '/auth/login' in page.url or '/login' in page.url:
-                shot("login_required")
-                return {'status': 'bad', 'detail': 'Cookie 失效，被踢去登入頁',
-                        'due_before': '', 'due_after': '', 'shots': shots}
+            for sid in ids:
+                log(f"━━━ 服務 {sid} ━━━")
+                out = _renew_one_in_session(page, sid, shot_prefix=f"{shot_prefix}_{sid}")
+                out['id'] = sid
+                all_shots.extend(out.pop('shots', []))
+                results.append(out)
 
-            due_before = get_due_date(page)
-            log(f"📆 續期前到期: {due_before or '（抽唔到）'}")
-
-            # ---- 撳 Renew 打開 modal ----
-            log("🖱️ 準備點擊 Renew…")
-            renew_btn = page.locator('button[onclick*="showRenewAlert"], button:has-text("Renew")').first
-            create_btn = page.locator('button:has-text("Create Invoice")')
-
-            modal_opened = False
-            for i in range(6):
-                try:
-                    renew_btn.wait_for(state="visible", timeout=10000)
-                    renew_btn.scroll_into_view_if_needed(timeout=5000)
-                    log(f"🖱️ 第 {i + 1} 次點擊 Renew...")
-                    renew_btn.click(timeout=10000)
-
-                    time.sleep(2)
-                    page_text = page.locator("body").inner_text(timeout=10000)
-                    if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                        shot("renew_not_allowed")
-                        return {'status': 'skip', 'detail': '未到續期窗口',
-                                'due_before': due_before, 'due_after': due_before, 'shots': shots}
-                    err = _server_error_text(page)
-                    if err:
-                        shot("server_reject")
-                        return {'status': 'bad', 'detail': err,
-                                'due_before': due_before, 'due_after': due_before, 'shots': shots}
-
-                    try:
-                        create_btn.wait_for(state="visible", timeout=5000)
-                        modal_opened = True
-                        log("✅ modal 已彈出（見 Create Invoice）")
-                        break
-                    except Exception:
-                        # modal 可能先出 Turnstile，Create Invoice 稍後先出現
-                        if challenge_boxes(page):
-                            modal_opened = True
-                            log("✅ modal 已彈出（先出 Turnstile）")
-                            break
-                        log("⚠️ modal 未出現，準備重試…")
-                        time.sleep(2)
-                except Exception as e:
-                    log(f"❌ 點擊 Renew 出錯: {e}")
-
-            if not modal_opened:
-                shot("modal_failed")
-                return {'status': 'bad', 'detail': '撳 Renew 後 modal 彈唔出',
-                        'due_before': due_before, 'due_after': due_before, 'shots': shots}
-
-            # ---- modal 內 Turnstile ----
-            log("🛡️ 處理 modal 內 Turnstile…")
-            if not solve_turnstile(page, timeout=120, require_positive=True,
-                                   shot_on_timeout=f"{shot_prefix}_modal_ts.png"):
-                log("⚠️ modal Turnstile 未確認通過，嘗試照樣撳 Create Invoice…")
-
-            try:
-                create_btn.wait_for(state="visible", timeout=30000)
-            except Exception:
-                pass
-
-            create_clicked = False
-            for i in range(3):
-                try:
-                    log(f"🖱️ 點擊 Create Invoice（第 {i + 1} 次）...")
-                    create_btn.click(timeout=10000)
-                    create_clicked = True
-                    break
-                except Exception as e:
-                    log(f"⚠️ Create Invoice 點擊失敗: {e}")
-                    solve_turnstile(page, timeout=40, require_positive=True)
-
-            if not create_clicked:
-                shot("create_invoice_failed")
-                return {'status': 'bad', 'detail': '撳唔到 Create Invoice',
-                        'due_before': due_before, 'due_after': due_before, 'shots': shots}
-
-            # ---- 等跳落 invoice 頁 ----
-            invoice_url = None
-            t0 = time.time()
-            while time.time() - t0 < 120:
-                if '/invoice/' in page.url or '/payment/' in page.url:
-                    invoice_url = page.url
-                    log(f"🎉 已跳落: {invoice_url}")
-                    break
-                if page.locator(f'iframe[src*="{TURNSTILE_FRAME_URL_MARKER}"]').count() > 0:
-                    solve_turnstile(page, timeout=45, reload_after=8)
-                time.sleep(1)
-
-            if not invoice_url:
-                shot("stuck_invoice")
-                err = _server_error_text(page)
-                return {'status': 'bad',
-                        'detail': err or '撳完 Create Invoice 但冇跳落發票頁',
-                        'due_before': due_before, 'due_after': due_before, 'shots': shots}
-
-            # ---- 發票頁撳 Pay ----
-            refresh_manage()
-            if page.url != invoice_url:
-                page.goto(invoice_url, wait_until="domcontentloaded", timeout=60000)
-            solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8,
-                            shot_on_timeout=f"{shot_prefix}_invoice_ts.png")
-
-            pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
-            try:
-                pay_btn.wait_for(state="visible", timeout=30000)
-                pay_btn.click(timeout=15000)
-                log("✅ 已點擊 Pay")
-            except Exception as e:
-                log(f"⚠️ 搵唔到 Pay 掣: {e}")
-                shot("no_pay_button")
-                return {'status': 'bad', 'detail': '發票頁搵唔到 Pay 掣',
-                        'due_before': due_before, 'due_after': due_before, 'shots': shots}
-
-            time.sleep(6)
-            solve_turnstile(page, timeout=60, success_check=page_ready, reload_after=8)
-
-            # ---- 返去睇新到期日 ----
-            refresh_manage()
-            due_after = get_due_date(page)
-            log(f"📆 續期後到期: {due_after or '（抽唔到）'}")
-
-            if due_before and due_after and due_before != due_after:
-                log("✅ 續期確認：到期日已推後")
-                return {'status': 'ok', 'detail': f'續期成功（{due_before} → {due_after}）',
-                        'due_before': due_before, 'due_after': due_after, 'shots': shots}
-
-            shot("after_pay")
-            return {'status': 'bad', 'detail': f'付咗但到期日冇變（{due_before or "?"} → {due_after or "?"}）',
-                    'due_before': due_before, 'due_after': due_after, 'shots': shots}
+            return {'services': results, 'shots': all_shots}
 
         except Exception as e:
             log(f"❌ 瀏覽器流程異常: {e}")
             if page is not None:
-                shot("exception")
-            return {'status': 'bad', 'detail': f'瀏覽器流程異常：{e}',
-                    'due_before': '', 'due_after': '', 'shots': shots}
+                try:
+                    path = f"{shot_prefix}_exception.png"
+                    page.screenshot(path=path)
+                    all_shots.append(path)
+                except Exception:
+                    pass
+            return {'services': results or [{'id': sid or '?', 'status': 'bad',
+                                             'detail': f'瀏覽器流程異常：{e}',
+                                             'due_before': '', 'due_after': ''}
+                                            for sid in (service_ids or ['?'])],
+                    'shots': all_shots}
         finally:
             if browser is not None:
                 try:
                     browser.close()
                 except Exception:
                     pass
+
+
+def renew_via_browser(service_id, cookies, shot_prefix='hc', email='', password=''):
+    """單一服務嘅便利包裝（相容舊介面）"""
+    out = renew_account_via_browser([service_id], cookies, email, password, shot_prefix)
+    svc = (out.get('services') or [{}])[0]
+    svc['shots'] = out.get('shots', [])
+    return svc
