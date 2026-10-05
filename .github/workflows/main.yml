@@ -57,17 +57,6 @@ jobs:
         pip install patchright
         python -m patchright install --with-deps chrome
 
-    - name: Upload Browser Screenshots（browser 模式）
-      if: always() && inputs.mode == 'browser'
-      uses: actions/upload-artifact@v6
-      with:
-        name: hc-browser-shots
-        path: |
-          hc_*.png
-          attempt*.log
-        if-no-files-found: ignore
-        retention-days: 7
-
     - name: Run Script
       env:
         PYTHONUTF8: "1"
@@ -234,3 +223,14 @@ jobs:
         } >> "$GITHUB_STEP_SUMMARY"
     
         exit "$code"
+
+    - name: Upload Browser Screenshots（browser 模式）
+      if: always() && inputs.mode == 'browser'
+      uses: actions/upload-artifact@v6
+      with:
+        name: hc-browser-shots
+        path: |
+          hc_*.png
+          attempt*.log
+        if-no-files-found: ignore
+        retention-days: 7
