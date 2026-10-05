@@ -27,6 +27,14 @@ jobs:
   run-script:
     runs-on: ubuntu-latest
 
+    env:
+      # ⚠️ 必須放喺 job 層：schedule 事件冇 inputs，`if: inputs.mode == 'browser'`
+      # 會係 false，導致 xvfb + patchright 唔裝、xvfb-run 都唔用 → 排程全滅。
+      # 呢個係 A 方案落地時差啲踩中嘅坑。
+      HC_MODE: ${{ inputs.mode || 'browser' }}
+      HC_ALERT_DAYS: ${{ inputs.alert_days || '1' }}
+      HC_USE_XVFB: ${{ (inputs.mode || 'browser') == 'browser' && '1' || '0' }}
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v7
@@ -50,7 +58,7 @@ jobs:
     # 技術路線移植自 eooce/Auto-Renew-HidenCloud 的實測結論：headless 過唔到 CF，
     # 要真 Chrome（有 screen）+ Patchright（反偵測）+ frame 樹反查 closed shadow DOM
     - name: Install Browser Stack（browser 模式）
-      if: inputs.mode == 'browser'
+      if: env.HC_USE_XVFB == '1'
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
@@ -68,9 +76,6 @@ jobs:
         HC_PASSWORD: ${{ secrets.HC_PASSWORD }}
         # 面板 renew form 加咗 Cloudflare Turnstile，純 HTTP 提交必被拒；
         # GHA runner IP 上 headless 過唔到 Turnstile → 排程一律 watchdog，只在剩 ≤ alert_days 日叫人手
-        HC_MODE: ${{ inputs.mode || 'watchdog' }}
-        HC_ALERT_DAYS: ${{ inputs.alert_days || '1' }}
-        HC_USE_XVFB: ${{ inputs.mode == 'browser' && '1' || '0' }}
         WP_APP_TOKEN_ONE: ${{ secrets.WP_APP_TOKEN_ONE }}
         WP_UIDs: ${{ secrets.WP_UIDs }}
         WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
@@ -225,7 +230,7 @@ jobs:
         exit "$code"
 
     - name: Upload Browser Screenshots（browser 模式）
-      if: always() && inputs.mode == 'browser'
+      if: always() && env.HC_USE_XVFB == '1'
       uses: actions/upload-artifact@v6
       with:
         name: hc-browser-shots
