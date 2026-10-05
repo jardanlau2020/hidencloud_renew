@@ -74,6 +74,9 @@ jobs:
         PYTHONIOENCODING: UTF-8
         NOTIFY_CHANNEL: ${{ vars.NOTIFY_CHANNEL || secrets.NOTIFY_CHANNEL }}
         HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
+        # 選填：cookie 死咗就用呢兩個登入（browser 模式會自動解登入頁 Turnstile）
+        HC_EMAIL: ${{ secrets.HC_EMAIL }}
+        HC_PASSWORD: ${{ secrets.HC_PASSWORD }}
         # 面板 renew form 加咗 Cloudflare Turnstile，純 HTTP 提交必被拒；
         # GHA runner IP 上 headless 過唔到 Turnstile → 排程一律 watchdog，只在剩 ≤ alert_days 日叫人手
         HC_MODE: ${{ inputs.mode || 'watchdog' }}

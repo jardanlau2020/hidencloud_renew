@@ -368,6 +368,103 @@ def solve_turnstile(page, timeout=120, success_check=None,
     return False
 
 
+# ============================ 登入 ============================
+
+def _login_form_visible(p):
+    try:
+        return p.locator('input[type="password"]').first.is_visible()
+    except Exception:
+        return False
+
+
+def login_with_password(page, email, password):
+    """登入頁本身有第一道 Turnstile：通過後先會出帳密輸入框。
+
+    實測順序（eooce 方案）：solve(第一道) → 填帳密 → 等 8 秒 → solve(第二道，
+    require_positive，冇出現都照撳）→ 撳登入 → 可能再有第三道 → 等跳 dashboard
+    """
+    log(f"💣 嘗試帳密登入 {email[:2]}*** …")
+    page.goto(f"{BASE_URL}/auth/login", wait_until="domcontentloaded", timeout=60000)
+
+    log("🛡️ 處理登入頁第一道 Turnstile…")
+    if not solve_turnstile(page, timeout=180, success_check=_login_form_visible,
+                           reload_after=8, shot_on_timeout="hc_login_ts1.png"):
+        log("❌ 第一道 Turnstile 未通過，入唔到登入表單")
+        return False
+
+    email_sel = ('input[name="username"], input#username, input[name="email"], '
+                 'input[type="email"], input[name="EMAIL"]')
+    pwd_sel = ('input[name="password"], input#password, '
+               'input[name="PASSWORD"], input[type="password"]')
+    try:
+        email_input = page.locator(email_sel).first
+        pwd_input = page.locator(pwd_sel).first
+        email_input.wait_for(state="visible", timeout=60000)
+        email_input.click()
+        email_input.fill(email)
+        time.sleep(random.uniform(0.8, 1.5))
+        pwd_input.click()
+        pwd_input.fill(password)
+    except Exception as e:
+        log(f"❌ 填帳密出錯: {e}")
+        return False
+
+    log("⏳ 輸入完成，等 Turnstile 載入…")
+    time.sleep(8)
+
+    log("🛡️ 處理第二道 Turnstile…")
+    if not solve_turnstile(page, timeout=90, require_positive=True,
+                           shot_on_timeout="hc_login_ts2.png"):
+        log("⚠️ 第二道 Turnstile 未確認通過，仲係試下撳登入…")
+
+    try:
+        submit = page.locator('button[type="submit"], button:has-text("Login"), '
+                              'button:has-text("Sign in"), button:has-text("登录")').first
+        submit.click(timeout=15000)
+    except Exception as e:
+        log(f"⚠️ 撳登入掣失敗: {e}")
+        return False
+
+    # 提交後若再出現 Turnstile，一邊處理一邊等跳轉
+    solve_turnstile(page, timeout=45, success_check=lambda p: "/auth/login" not in (p.url or ""),
+                    shot_on_timeout="hc_login_ts3.png")
+    try:
+        page.wait_for_url(lambda u: "/auth/login" not in (u or ""), timeout=30000)
+    except Exception:
+        pass
+
+    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+    solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8,
+                    shot_on_timeout="hc_login_ts4.png")
+    if "/auth/login" in page.url:
+        log("❌ 帳密登入失敗（帳密錯／被封）")
+        return False
+    log("✅ 帳密登入成功，已到 dashboard")
+    return True
+
+
+def ensure_session(page, cookies, email="", password=""):
+    """cookie 先行；cookie 死咗就退帳密登入。返 True = 已登入。"""
+    if cookies:
+        try:
+            page.context.add_cookies(cookies)
+            log(f"📇 已注入 {len(cookies)} 個 cookie")
+        except Exception as e:
+            log(f"⚠️ 注入 cookie 出錯: {e}")
+        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+        solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8,
+                        shot_on_timeout="hc_session_guard.png")
+        if "/auth/login" not in (page.url or ""):
+            log("✅ Cookie 會話有效")
+            return True
+        log("⚠️ Cookie 唔認帳，轉帳密登入…")
+
+    if not (email and password):
+        log("❌ 冇帳密可用，而 cookie 又已失效")
+        return False
+    return login_with_password(page, email, password)
+
+
 # ============================ Cookie 橋接 ============================
 
 def cookie_records_from_jar(jar):
@@ -456,12 +553,18 @@ def renew_via_browser(service_id, cookies, shot_prefix='hc', timeout_minutes_hin
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
 
-            if cookies:
+            # 會話：cookie 先行，死咗就退帳密登入（HC_EMAIL / HC_PASSWORD）
+            email = (os.environ.get('HC_EMAIL') or '').strip()
+            password = (os.environ.get('HC_PASSWORD') or '').strip()
+            if not ensure_session(page, cookies, email, password):
                 try:
-                    context.add_cookies(cookies)
-                    log(f"📇 已注入 {len(cookies)} 個 cookie")
-                except Exception as e:
-                    log(f"⚠️ 注入 cookie 出錯: {e}")
+                    page.screenshot(path=f"{shot_prefix}_login_fail.png")
+                    shots.append(f"{shot_prefix}_login_fail.png")
+                except Exception:
+                    pass
+                return {'status': 'bad',
+                        'detail': '登入唔到（cookie 失效且冇可用帳密）',
+                        'due_before': '', 'due_after': '', 'shots': shots}
 
             log(f"➡ 前往服務頁 {service_url}")
             page.goto(service_url, wait_until="domcontentloaded", timeout=60000)
