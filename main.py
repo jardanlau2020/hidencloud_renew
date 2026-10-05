@@ -112,7 +112,7 @@ LOCAL_CACHE_PATH = os.path.join(os.path.dirname(__file__), CACHE_FILE_NAME)
 # 而 GHA runner IP 上 headless Chrome 連 Turnstile iframe 都唔 render
 #   （uc 模式 cf_iframe=0；plain 模式直接食 CF interstitial "Just a moment..."）
 # 所以自動續期喺 CI 環境行唔通 → 預設降級做 watchdog，只在剩 ≤ HC_ALERT_DAYS 日時叫人手。
-HC_MODE = (os.environ.get('HC_MODE') or 'renew').strip().lower()
+HC_MODE = (os.environ.get('HC_MODE') or 'watchdog').strip().lower()
 try:
     HC_ALERT_DAYS = int(os.environ.get('HC_ALERT_DAYS') or 1)
 except (TypeError, ValueError):
@@ -586,6 +586,48 @@ class HidenCloudBot:
         self.log(f"🟢 watchdog：未到續期窗口（剩 {days} 天，{due or '到期日未知'} 到期），唔提交")
         return service_result('skip', f'未到續期窗口 · 剩 {days} 天 · {due_short}')
 
+    def renew_via_browser(self, service_id, manage_res):
+        """browser 模式：用真瀏覽器（Patchright + frame 樹反查）過 Cloudflare Turnstile 續期。
+
+        純 HTTP 路徑喺 2026-10 起一定被拒（cf-turnstile-response field is required），
+        所以呢條路徑係唯一有望喺 CI 層自動續到嘅辦法。
+        """
+        days, due = self.parse_expiry_info(manage_res.text)
+        self.log(f"📆 續期前：{due or '到期日未知'}"
+                 f"{'' if days is None else f'（剩 {days} 天）'}")
+
+        try:
+            import hc_browser
+        except ImportError as e:
+            self.log(f"❌ 載入 hc_browser 失敗: {e}")
+            return service_result('bad', 'hc_browser 模組缺失')
+
+        cookies = hc_browser.cookie_records_from_jar(self.session.cookies)
+        if not cookies:
+            self.log("❌ 冇 cookie 注入瀏覽器")
+            return service_result('bad', 'Cookie 為空，無法起瀏覽器')
+
+        self.log(f"🖥️ 轉真瀏覽器路徑（{len(cookies)} 個 cookie）...")
+        outcome = hc_browser.renew_via_browser(service_id, cookies, shot_prefix=f"hc_{service_id}")
+        for path in outcome.get('shots', []):
+            self.log(f"🖼️ {path}")
+
+        status = outcome.get('status')
+        detail = outcome.get('detail', '')
+
+        if status == 'ok':
+            self.log(f"✅ 瀏覽器續期成功：{detail}")
+            return service_result('ok', detail)
+
+        if status == 'skip':
+            self.log(f"⏳ 瀏覽器續期：{detail}")
+            return service_result('skip', detail)
+
+        self.log(f"❌ 瀏覽器續期失敗：{detail}")
+        self.last_reject = detail
+        self.mark_retry_needed(f"瀏覽器續期未完成（服務 {service_id}）")
+        return service_result('bad', detail or '瀏覽器續期未完成')
+
     def submit_renew_request(self, service_id, soup, referer_url):
         form, action_url = self.find_renew_form(soup, service_id)
         payload = self.extract_form_payload(form) if form else {}
@@ -715,6 +757,10 @@ class HidenCloudBot:
             # ================== 2.5 watchdog 模式：只讀到期，唔提交 ==================
             if HC_MODE == 'watchdog':
                 return self.watchdog_verdict(manage_res.text)
+
+            # ================== 2.6 browser 模式：真瀏覽器過 Turnstile ==================
+            if HC_MODE == 'browser':
+                return self.renew_via_browser(service['id'], manage_res)
 
             # ================== 3. 检测是否允许续期 ==================
             renew_btn = soup.find('button', onclick=re.compile(r'showRenewAlert'))

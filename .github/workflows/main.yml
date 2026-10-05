@@ -5,11 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: '運行模式：watchdog = 只讀到期狀態（面板有 Turnstile，CI 自動續期行唔通）；renew = 嘗試自動續期'
+        description: '運行模式：watchdog = 只讀到期狀態（排程預設）；browser = 真瀏覽器（Patchright + frame 樹反查）過 Cloudflare Turnstile 續期；renew = 純 HTTP 續期（已被 Turnstile 擋死，僅留作對照）'
         type: choice
         default: 'watchdog'
         options:
           - 'watchdog'
+          - 'browser'
           - 'renew'
       alert_days:
         description: '剩幾多日開始叫人手續期（watchdog 模式）'
@@ -45,6 +46,28 @@ jobs:
       run: |
         pip install -r requirements.txt
 
+    # ================= browser 模式專用：真 Chrome + 虛擬屏 + Patchright =================
+    # 技術路線移植自 eooce/Auto-Renew-HidenCloud 的實測結論：headless 過唔到 CF，
+    # 要真 Chrome（有 screen）+ Patchright（反偵測）+ frame 樹反查 closed shadow DOM
+    - name: Install Browser Stack（browser 模式）
+      if: inputs.mode == 'browser'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb
+        pip install patchright
+        python -m patchright install --with-deps chrome
+
+    - name: Upload Browser Screenshots（browser 模式）
+      if: always() && inputs.mode == 'browser'
+      uses: actions/upload-artifact@v6
+      with:
+        name: hc-browser-shots
+        path: |
+          hc_*.png
+          attempt*.log
+        if-no-files-found: ignore
+        retention-days: 7
+
     - name: Run Script
       env:
         PYTHONUTF8: "1"
@@ -55,6 +78,7 @@ jobs:
         # GHA runner IP 上 headless 過唔到 Turnstile → 排程一律 watchdog，只在剩 ≤ alert_days 日叫人手
         HC_MODE: ${{ inputs.mode || 'watchdog' }}
         HC_ALERT_DAYS: ${{ inputs.alert_days || '1' }}
+        HC_USE_XVFB: ${{ inputs.mode == 'browser' && '1' || '0' }}
         WP_APP_TOKEN_ONE: ${{ secrets.WP_APP_TOKEN_ONE }}
         WP_UIDs: ${{ secrets.WP_UIDs }}
         WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
@@ -139,17 +163,24 @@ jobs:
         WEBDAV_PASS: ${{ secrets.WEBDAV_PASS }}
       run: |
         set +e
-    
+
+        if [ "$HC_USE_XVFB" = "1" ]; then
+          RUN_CMD='xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u main.py'
+        else
+          RUN_CMD='python -u main.py'
+        fi
+        echo "▶ 執行命令: $RUN_CMD"
+
         echo "::group::🚀 HidenCloud Renew - Attempt 1"
         echo "========================================"
         echo "🚀 HidenCloud Renew - Attempt 1"
         echo "========================================"
     
-        python main.py 2>&1 | tee attempt1.log
+        eval $RUN_CMD 2>&1 | tee attempt1.log
         code=${PIPESTATUS[0]}
     
         echo "::group::🔎 Attempt 1 Highlights"
-        grep -E '\[RENEW_RESULT\]|\[COOKIE_NORMALIZED\]|支付成功|续期成功|登录失败|重跑|失败' attempt1.log || true
+        grep -E '\[RENEW_RESULT\]|\[COOKIE_NORMALIZED\]|\[browser\]|支付成功|续期成功|登录失败|重跑|失败' attempt1.log || true
         echo "::endgroup::"
         echo "::endgroup::"
     
@@ -176,11 +207,11 @@ jobs:
         echo "🔁 HidenCloud Renew - Attempt 2"
         echo "========================================"
     
-        python main.py 2>&1 | tee attempt2.log
+        eval $RUN_CMD 2>&1 | tee attempt2.log
         code=${PIPESTATUS[0]}
     
         echo "::group::🔎 Attempt 2 Highlights"
-        grep -E '\[RENEW_RESULT\]|\[COOKIE_NORMALIZED\]|支付成功|续期成功|登录失败|重跑|失败' attempt2.log || true
+        grep -E '\[RENEW_RESULT\]|\[COOKIE_NORMALIZED\]|\[browser\]|支付成功|续期成功|登录失败|重跑|失败' attempt2.log || true
         echo "::endgroup::"
         echo "::endgroup::"
     
