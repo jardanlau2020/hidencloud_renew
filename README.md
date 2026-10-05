@@ -308,3 +308,34 @@
 ---
 
 如果这个项目对你有帮助，欢迎点个 Star ⭐
+
+---
+
+## ⚠️ 續期模式說明（2026-10 起）
+
+面板 renew form 已加 **Cloudflare Turnstile**：
+
+```html
+<form id="renew-form-<id>" action="/service/<id>/renew" method="POST"
+      onsubmit="return hidenRenewCaptchaGuard(this, 'renew-captcha-wait-<id>')">
+  <div class="cf-turnstile" data-sitekey="0x4AAAAAAAPmSriFX9MUUlyZ"> ... </div>
+</form>
+```
+
+純 HTTP 提交（無 Turnstile token）一律被拒：
+`Info Error! The cf-turnstile-response field is required.`
+
+而 GitHub Actions runner IP 上就算用真 headless Chrome 都過唔到（實測 2026-10-05）：
+- uc / undetected 模式：`window.turnstile` 存在、widget 喺 modal 入面且可見，但 **CF iframe 從頭到尾冇建立**，token 恆空
+- plain headless 模式：直接撞 Cloudflare interstitial（`Just a moment...` / `chl_page/v1`）
+
+所以排程預設 **watchdog 模式**：只讀面板到期狀態，唔提交續期。
+
+| 模式 | 行為 | 點用 |
+| --- | --- | --- |
+| `watchdog`（預設） | 讀到期日；剩 ≤ `alert_days` 日就 TG 叫人 | 排程／gha_keeper 每日自動 |
+| `renew` | 嘗試自動續期（需要面板有 bypass 先至有效） | workflow_dispatch 手動揀 `mode=renew` |
+
+環境變數：`HC_MODE`（`watchdog` / `renew`）、`HC_ALERT_DAYS`（預設 `1`）。
+
+**人手續期**：登入 `https://dash.hidencloud.com/service/<id>/manage` → 撳 **Renew** → 過 Turnstile → **Create Invoice**（免費服務 1 Week = €0.00）。

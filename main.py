@@ -8,6 +8,7 @@ import time
 import json
 import random
 import re
+from datetime import datetime, timezone
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -104,6 +105,19 @@ RENEW_DAYS = 7
 CACHE_FILE_NAME = 'hiden_cookies.json'
 LOCAL_CACHE_PATH = os.path.join(os.path.dirname(__file__), CACHE_FILE_NAME)
 
+# 運行模式：renew（預設，嘗試自動續期） / watchdog（只讀到期狀態，唔提交續期）
+# 背景：面板 renew form 已加 Cloudflare Turnstile
+#   <form id="renew-form-<id>" onsubmit="return hidenRenewCaptchaGuard(...)">
+#   純 HTTP 提交一律被拒：Info Error! The cf-turnstile-response field is required.
+# 而 GHA runner IP 上 headless Chrome 連 Turnstile iframe 都唔 render
+#   （uc 模式 cf_iframe=0；plain 模式直接食 CF interstitial "Just a moment..."）
+# 所以自動續期喺 CI 環境行唔通 → 預設降級做 watchdog，只在剩 ≤ HC_ALERT_DAYS 日時叫人手。
+HC_MODE = (os.environ.get('HC_MODE') or 'renew').strip().lower()
+try:
+    HC_ALERT_DAYS = int(os.environ.get('HC_ALERT_DAYS') or 1)
+except (TypeError, ValueError):
+    HC_ALERT_DAYS = 1
+
 # ================= 全局日志收集器 =================
 ALL_LOGS = []
 
@@ -167,6 +181,14 @@ def sleep_random(min_ms=3000, max_ms=8000):
     sec = random.randint(min_ms, max_ms) / 1000.0
     time.sleep(sec)
 
+def fmt_due(due):
+    """面板日期字串（06 Oct 2026）→ MM-DD；解析唔到就原樣返回"""
+    try:
+        return datetime.strptime(str(due).strip(), "%d %b %Y").strftime("%m-%d")
+    except (TypeError, ValueError):
+        return str(due or "")
+
+
 def service_result(status, detail=""):
     """單個服務嘅通知結果（status: ok / skip / bad），餵畀 notify.build_summary。"""
     return {"status": status, "detail": detail}
@@ -215,6 +237,8 @@ class HidenCloudBot:
         self.non_payable_invoices = set()
         # 标记本账号本轮是否建议由 GitHub Actions 稍后重跑一次
         self.retry_needed = False
+        # 最近一次「服务端拒绝」嘅原文（带进通知，方便一眼睇原因）
+        self.last_reject = ""
 
         cached_data = CacheManager.load()
         cached_cookie = cached_data.get(str(index))
@@ -513,6 +537,55 @@ class HidenCloudBot:
         self._refresh_csrf(soup)
         return manage_res, soup
 
+    def parse_expiry_info(self, html):
+        """從管理頁 HTML 抽（剩餘日數, 到期日期字串）；抽唔到日數就 (None, "")。
+
+        面板喺 renew modal 嘅 Blade 模板／datepicker 標題都會印出到期日，例如
+        `Current Due Date 06 Oct 2026`、`... 1 day from now.`、`expires in 3 days`
+        """
+        text = html or ""
+        due = ""
+        for pat in (r'Current Due Date\s*([0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{4})',
+                    r'expires on the\s*([0-9]{1,2}\s+[A-Za-z]{3}\s+[0-9]{4})'):
+            match = re.search(pat, text, re.I)
+            if match:
+                due = match.group(1)
+                break
+
+        days = None
+        match = re.search(r'([0-9]+)\s+days?\s+from now', text, re.I)
+        if match:
+            days = int(match.group(1))
+        if days is None:
+            match = re.search(r'expires in\s*([0-9]+)\s+days?', text, re.I)
+            if match:
+                days = int(match.group(1))
+        if days is None and due:
+            # 面板淨係畀日期：自己算差日數（用 UTC 日界，跟面板 server clock 夠用）
+            try:
+                target = datetime.strptime(due, "%d %b %Y").date()
+                days = max(0, (target - datetime.now(timezone.utc).date()).days)
+            except ValueError:
+                days = None
+        return days, due
+
+    def watchdog_verdict(self, manage_html):
+        """watchdog 模式：只讀到期狀態，唔提交續期。
+
+        返回 service_result dict。剩 ≤ HC_ALERT_DAYS 日 = 已入續期窗口，要人手。
+        """
+        days, due = self.parse_expiry_info(manage_html)
+        if days is None:
+            self.log("⚠️ watchdog：面板頁面搵唔到到期資料（可能改版）")
+            return service_result('bad', '讀唔到到期資料（面板改版？）')
+        due_short = f'{fmt_due(due)} 到期' if due else '到期日未知'
+        if days <= HC_ALERT_DAYS:
+            self.log(f"🚨 watchdog：已入續期窗口（剩 {days} 天，{due or '到期日未知'}），"
+                     f"面板 renew form 需人手過 Cloudflare Turnstile")
+            return service_result('bad', f'要人手續期（剩 {days} 天 · {due_short}）')
+        self.log(f"🟢 watchdog：未到續期窗口（剩 {days} 天，{due or '到期日未知'} 到期），唔提交")
+        return service_result('skip', f'未到續期窗口 · 剩 {days} 天 · {due_short}')
+
     def submit_renew_request(self, service_id, soup, referer_url):
         form, action_url = self.find_renew_form(soup, service_id)
         payload = self.extract_form_payload(form) if form else {}
@@ -558,6 +631,7 @@ class HidenCloudBot:
         server_error = self.extract_server_error_message(soup_resp)
         if server_error:
             self.log(f"⚠️ 续期请求被服务端拒绝，页面提示: {server_error}")
+            self.last_reject = server_error
             return True, 'server_reject'
 
         invoice_links = self.extract_invoice_links(soup_resp, require_payment_context=False)
@@ -580,6 +654,7 @@ class HidenCloudBot:
         err_div = soup_resp.find('div', class_=re.compile(r'(alert-danger|text-danger|error)'))
         if err_div:
             self.log(f"⚠️ 续期请求被服务端拒绝，页面提示: {err_div.get_text(strip=True)}")
+            self.last_reject = err_div.get_text(strip=True)
             return True, 'server_reject'
 
         if not allow_invoice_poll:
@@ -637,6 +712,10 @@ class HidenCloudBot:
             # 2. 获取管理页面，同时刷新 CSRF token
             manage_res, soup = self.fetch_manage_page(service['id'])
 
+            # ================== 2.5 watchdog 模式：只讀到期，唔提交 ==================
+            if HC_MODE == 'watchdog':
+                return self.watchdog_verdict(manage_res.text)
+
             # ================== 3. 检测是否允许续期 ==================
             renew_btn = soup.find('button', onclick=re.compile(r'showRenewAlert'))
             if renew_btn:
@@ -683,7 +762,10 @@ class HidenCloudBot:
                 outcome_result = service_result('ok')
             elif handled and outcome == 'server_reject':
                 self.log(f"[RENEW_RESULT] {'重建会话后' if rebuild_retry else '当前会话'}提交已被服务端拒绝")
-                outcome_result = service_result('bad', "續期請求被服務端拒絕")
+                reject_detail = "續期請求被服務端拒絕"
+                if self.last_reject:
+                    reject_detail += f"：{self.last_reject}"
+                outcome_result = service_result('bad', reject_detail)
             else:
                 outcome_result = None
 

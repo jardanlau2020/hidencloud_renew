@@ -3,6 +3,18 @@ name: HidenCloud Auto Renew (Python)
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: '運行模式：watchdog = 只讀到期狀態（面板有 Turnstile，CI 自動續期行唔通）；renew = 嘗試自動續期'
+        type: choice
+        default: 'watchdog'
+        options:
+          - 'watchdog'
+          - 'renew'
+      alert_days:
+        description: '剩幾多日開始叫人手續期（watchdog 模式）'
+        type: string
+        default: '1'
   schedule:
     # 初始时间，脚本会自动修改这个分钟数
     - cron: '22 2 * * *'
@@ -39,6 +51,10 @@ jobs:
         PYTHONIOENCODING: UTF-8
         NOTIFY_CHANNEL: ${{ vars.NOTIFY_CHANNEL || secrets.NOTIFY_CHANNEL }}
         HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
+        # 面板 renew form 加咗 Cloudflare Turnstile，純 HTTP 提交必被拒；
+        # GHA runner IP 上 headless 過唔到 Turnstile → 排程一律 watchdog，只在剩 ≤ alert_days 日叫人手
+        HC_MODE: ${{ inputs.mode || 'watchdog' }}
+        HC_ALERT_DAYS: ${{ inputs.alert_days || '1' }}
         WP_APP_TOKEN_ONE: ${{ secrets.WP_APP_TOKEN_ONE }}
         WP_UIDs: ${{ secrets.WP_UIDs }}
         WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
