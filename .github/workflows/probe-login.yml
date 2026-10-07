@@ -10,6 +10,14 @@ name: HidenCloud Login Probe (read-only)
 
 on:
   workflow_dispatch:
+    inputs:
+      probe_mode:
+        description: 'direct = 乾淨 context 直入登入頁；cookie_first = 先注入死 cookie 再去登入（複製生產情境）'
+        type: choice
+        default: 'direct'
+        options:
+          - 'direct'
+          - 'cookie_first'
 
 permissions:
   contents: read
@@ -20,6 +28,7 @@ jobs:
     env:
       HC_MODE: browser
       HC_USE_XVFB: "1"
+      HC_PROBE_MODE: ${{ inputs.probe_mode || 'direct' }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7

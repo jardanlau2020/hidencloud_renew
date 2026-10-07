@@ -39,6 +39,10 @@ from hc_browser import (BASE_URL, STEALTH_JS, _login_form_visible, _sync_playwri
 
 EMAIL = os.environ.get("HC_EMAIL", "") or ""
 PASSWORD = os.environ.get("HC_PASSWORD", "") or ""
+COOKIE = os.environ.get("HIDEN_COOKIE", "") or ""
+# direct     = 乾淨 context 直入登入頁（v1 已做，成功）
+# cookie_first = 先注入死 cookie → /dashboard 被彈 → 再做帳密登入（複製生產 run 情境）
+PROBE_MODE = os.environ.get("HC_PROBE_MODE", "direct")
 
 REPORT_PATH = "probe_report.json"
 SHOT_PREFIX = "probe"
@@ -130,12 +134,29 @@ def token_len_in_body(body: str) -> int:
     return 0
 
 
+def parse_cookie_env(raw: str):
+    """'a=1;b=2' → playwright cookie dicts（只回報數量／名，唔回報值）"""
+    out = []
+    for part in (raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if not name:
+            continue
+        out.append({"name": name, "value": value, "url": BASE_URL})
+    return out
+
+
 def main() -> int:
     log("=" * 60)
     log("HidenCloud 帳密登入探針（只讀；唔會續期）")
+    log(f"模式: {PROBE_MODE}")
     log("=" * 60)
     note("creds", email_len=len(EMAIL), password_len=len(PASSWORD),
-         creds_present=bool(EMAIL and PASSWORD))
+         creds_present=bool(EMAIL and PASSWORD), mode=PROBE_MODE,
+         cookie_env_len=len(COOKIE))
     if not (EMAIL and PASSWORD):
         log("❌ 冇帳密，探針無意義")
         return 0
@@ -165,6 +186,13 @@ def main() -> int:
                         body = req.post_data or ""
                     except Exception:
                         pass
+                    ck_names = []
+                    try:
+                        ck_hdr = (req.headers or {}).get("cookie", "") or ""
+                        ck_names = [p.split("=")[0].strip()
+                                    for p in ck_hdr.split(";") if "=" in p]
+                    except Exception:
+                        pass
                     report["net_post"].append({
                         "url": req.url,
                         "body_len": len(body),
@@ -172,11 +200,13 @@ def main() -> int:
                         "turnstile_value_len": token_len_in_body(body),
                         "has_password_field": "password" in body.lower(),
                         "has_email_field": ("email" in body.lower() or "username" in body.lower()),
+                        "cookie_names": ck_names,
                         "at": time.strftime("%H:%M:%S"),
                     })
                     log(f"🌐 POST → {req.url} | body_len={len(body)} "
                         f"| token_field={'turnstile' in body.lower()} "
-                        f"| token_len={token_len_in_body(body)}")
+                        f"| token_len={token_len_in_body(body)} "
+                        f"| cookies={','.join(ck_names)}")
                 except Exception:
                     pass
 
@@ -197,6 +227,23 @@ def main() -> int:
 
             page.on("request", on_request)
             page.on("response", on_response)
+
+            # ---- 0. cookie_first 模式：先複製生產 run 嘅前置狀態 ----
+            if PROBE_MODE == "cookie_first":
+                cks = parse_cookie_env(COOKIE)
+                note("cookie_inject", n=len(cks), names=[c["name"] for c in cks])
+                try:
+                    if cks:
+                        context.add_cookies(cks)
+                    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded",
+                              timeout=60000)
+                    time.sleep(8)
+                    info0 = page.evaluate(_TITLE_URL_JS)
+                    note("after_cookie_dashboard", url=info0["url"], title=info0["title"],
+                         bounced_to_login=("/auth/login" in info0["url"]))
+                    shot(page, "00_cookie_first")
+                except Exception as e:
+                    note("cookie_inject", err=str(e)[:200])
 
             # ---- 1. 去登入頁 ----
             page.goto(f"{BASE_URL}/auth/login", wait_until="domcontentloaded", timeout=60000)
@@ -269,6 +316,13 @@ def main() -> int:
             # 提交前最後狀態（H1 關鍵：token 有無）
             before_submit = page.evaluate(_FORM_DUMP_JS)
             report["form_before_submit"] = before_submit
+            try:
+                ck_now = context.cookies()
+                report["context_cookies_before_submit"] = [c["name"] for c in ck_now]
+                note("context_cookies_before_submit", n=len(ck_now),
+                     names=[c["name"] for c in ck_now])
+            except Exception as e:
+                note("context_cookies_before_submit", err=str(e)[:120])
             note("before_submit", ts_state=st,
                  alert=page.evaluate(_ALERT_JS)[:3])
 
@@ -314,22 +368,33 @@ def main() -> int:
                 log(f"   ⚠️ alert[{a['sel']}]: {a['text']}")
             shot(page, "08_final")
 
-            # ---- 9. 裁決 ----
+            # ---- 9. 裁決（睇硬證據，唔靠單一 alert 猜）----
             posts = report["net_post"]
-            real_post = [x for x in posts if "auth/login" in x["url"] or "login" in x["url"]]
+            real_post = [x for x in posts if "/auth/login" in x["url"]]
             token_seen = any(x["turnstile_value_len"] > 20 for x in posts)
+            landed_dashboard = "/auth/login" not in (after["url"] or "")
+            alert_txt = " ".join(a["text"].lower() for a in alerts)
+            success_hint = any(k in alert_txt for k in
+                               ("welcome back", "success", "欢迎", "成功"))
             verdict = []
             if not real_post:
-                verdict.append("H1/H2：完全冇 POST 出去 → 表單未提交（前端擋住／撳掣無效）")
+                verdict.append("H1/H2：完全冇 POST 去 /auth/login → 表單未提交")
             else:
-                if token_seen:
-                    verdict.append("POST 帶咗 Turnstile token（長度正常）")
+                verdict.append(f"有真 POST 去 /auth/login（body_len={real_post[-1]['body_len']}）")
+                verdict.append("POST 帶咗 Turnstile token（len=%d）→ H1 否決"
+                               % real_post[-1]["turnstile_value_len"]
+                               if token_seen else "POST 冇有效 token → H1 成立")
+            if landed_dashboard:
+                verdict.append("✅ 最終 URL 係 dashboard → 登入成功")
+            elif success_hint:
+                verdict.append("✅ 服務端回成功字句但頁面未跳轉（可能導航時序）")
+            else:
+                verdict.append("❌ 最終仍喺 /auth/login，且無成功字句 → 登入被拒")
+                if alerts:
+                    verdict.append("服務端錯誤文字："
+                                   + " | ".join(a["text"][:120] for a in alerts[:3]))
                 else:
-                    verdict.append("H1：POST 冇有效 Turnstile token → 站方必以 captcha 拒")
-            if alerts:
-                verdict.append(f"服務端有回錯誤文字（見 alerts）→ 可能係 H3 帳密錯")
-            elif real_post:
-                verdict.append("H3 未成立：服務端冇回任何錯誤 banner")
+                    verdict.append("服務端冇回任何錯誤文字 → 唔似帳密錯，似 CSRF/session 問題")
             report["verdict"] = verdict
             for v in verdict:
                 log(f"🧾 {v}")
