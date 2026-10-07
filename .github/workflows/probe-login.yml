@@ -1,0 +1,67 @@
+# 一次性只讀探針：診斷 HidenCloud 帳密登入路徑（唔續期、唔改站方狀態）
+#
+# 目的：分清 10-07 run 37599106127「帳密登入失敗」嘅真因
+#   H1 Turnstile 假通過（冇有效 token）
+#   H2 填值冇生效（提交空表單）
+#   H3 帳密真係錯（服務端會回 “These credentials do not match our records.”）
+#
+# 只手動 dispatch，冇 schedule —— 用完即刪。
+name: HidenCloud Login Probe (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      HC_MODE: browser
+      HC_USE_XVFB: "1"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Browser Stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install patchright
+          python -m patchright install --with-deps chrome
+
+      - name: Run Probe (read-only)
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: UTF-8
+          HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
+          HC_EMAIL: ${{ secrets.HC_EMAIL }}
+          HC_PASSWORD: ${{ secrets.HC_PASSWORD }}
+        run: |
+          set +e
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
+            python -u hc_probe_login.py 2>&1 | tee probe.log
+          echo "probe exit: ${PIPESTATUS[0]}"
+          exit 0
+
+      - name: Upload Probe Artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hc-login-probe
+          path: |
+            probe_report.json
+            probe.log
+            probe_*.png
+          if-no-files-found: ignore
+          retention-days: 7
