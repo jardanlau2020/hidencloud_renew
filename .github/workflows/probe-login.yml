@@ -12,12 +12,13 @@ on:
   workflow_dispatch:
     inputs:
       probe_mode:
-        description: 'direct = 乾淨 context 直入登入頁；cookie_first = 先注入死 cookie 再去登入（複製生產情境）'
+        description: 'direct = 乾淨 context 直入登入頁；cookie_first = 先注入死 cookie 再去登入；fix_check = 驗收修正（行生產同一條 ensure_session）'
         type: choice
         default: 'direct'
         options:
           - 'direct'
           - 'cookie_first'
+          - 'fix_check'
 
 permissions:
   contents: read
@@ -58,8 +59,14 @@ jobs:
           HC_PASSWORD: ${{ secrets.HC_PASSWORD }}
         run: |
           set +e
+          if [ "$HC_PROBE_MODE" = "fix_check" ]; then
+            SCRIPT=hc_probe_fix.py
+          else
+            SCRIPT=hc_probe_login.py
+          fi
+          echo "▶ 執行 $SCRIPT (mode=$HC_PROBE_MODE)"
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-            python -u hc_probe_login.py 2>&1 | tee probe.log
+            python -u "$SCRIPT" 2>&1 | tee probe.log
           echo "probe exit: ${PIPESTATUS[0]}"
           exit 0
 
@@ -70,7 +77,9 @@ jobs:
           name: hc-login-probe
           path: |
             probe_report.json
+            fix_report.json
             probe.log
             probe_*.png
+            fix_*.png
           if-no-files-found: ignore
           retention-days: 7

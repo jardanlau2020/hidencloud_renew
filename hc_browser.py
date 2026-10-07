@@ -377,6 +377,54 @@ def _login_form_visible(p):
         return False
 
 
+# ===== 死 cookie 污染登入 POST（2026-10-07 實測根因）=====
+# 生產 run 37599106127：注入 4 個死 cookie → /dashboard 被彈 → 退帳密登入 → 報「帳密錯」。
+# 探針實測（只讀，兩版對照）：
+#   direct（乾淨 context）      → POST /auth/login 帶 token → 302 /dashboard ✅
+#   cookie_first（先注入死 cookie）→ POST /auth/login 帶 token → 419 Page Expired ❌
+# 原因：舊 `hidencloud_session` / `XSRF-TOKEN` 同頁面新發嘅並存（POST 上見到兩個同名），
+#       伺服器揀舊嗰份 → CSRF 對唔上 → Laravel 419。帳密本身完全正確。
+# 所以退帳密登入之前，必須清走舊「應用層 session」cookie；
+# CF 憑證（cf_clearance / hc_cf_turnstile）保留，唔係就要重過 Cloudflare。
+STALE_APP_COOKIE_RE = re.compile(r"^(hidencloud_session|XSRF-TOKEN|remember_web_)", re.I)
+
+LAST_LOGIN_ERROR = ""
+
+
+def _set_login_error(msg):
+    global LAST_LOGIN_ERROR
+    LAST_LOGIN_ERROR = msg
+
+
+def purge_stale_app_cookies(page):
+    """清走舊應用層 session cookie（保留 Cloudflare 憑證）。返清除數量。"""
+    removed = 0
+    try:
+        cookies = page.context.cookies()
+    except Exception as e:
+        log(f"⚠️ 讀 cookie 失敗: {e}")
+        return 0
+    for c in cookies:
+        name = c.get("name", "")
+        if not STALE_APP_COOKIE_RE.match(name):
+            continue
+        ok = False
+        for kwargs in ({"name": name, "domain": c.get("domain"), "path": c.get("path")},
+                       {"name": name, "url": BASE_URL},
+                       {"name": name}):
+            try:
+                page.context.clear_cookies(**kwargs)
+                ok = True
+                break
+            except Exception:
+                continue
+        if ok:
+            removed += 1
+    if removed:
+        log(f"🧹 清走 {removed} 個舊 session cookie（保留 CF 憑證）")
+    return removed
+
+
 def login_with_password(page, email, password):
     """登入頁本身有第一道 Turnstile：通過後先會出帳密輸入框。
 
@@ -384,6 +432,9 @@ def login_with_password(page, email, password):
     require_positive，冇出現都照撳）→ 撳登入 → 可能再有第三道 → 等跳 dashboard
     """
     log(f"💣 嘗試帳密登入 {email[:2]}*** …")
+    # 清走死 session cookie：否則舊 XSRF-TOKEN / hidencloud_session 會令
+    # 登入 POST 變 419 Page Expired（見上面 STALE_APP_COOKIE_RE 註解）
+    purge_stale_app_cookies(page)
     page.goto(f"{BASE_URL}/auth/login", wait_until="domcontentloaded", timeout=60000)
 
     log("🛡️ 處理登入頁第一道 Turnstile…")
@@ -433,13 +484,25 @@ def login_with_password(page, email, password):
     except Exception:
         pass
 
+    # 419 = Laravel CSRF/session 對唔上（Page Expired），唔係帳密錯
+    try:
+        ttl = (page.title() or "").lower()
+    except Exception:
+        ttl = ""
+    if "page expired" in ttl or "419" in ttl:
+        log("❌ 419 Page Expired：登入 POST 被 CSRF/session 擋（唔係帳密問題）")
+        _set_login_error("登入被 419 CSRF 擋（session cookie 衝突，非帳密問題）")
+        return False
+
     page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
     solve_turnstile(page, timeout=90, success_check=page_ready, reload_after=8,
                     shot_on_timeout="hc_login_ts4.png")
     if "/auth/login" in page.url:
         log("❌ 帳密登入失敗（帳密錯／被封）")
+        _set_login_error("登入被拒或未跳轉（請檢查帳號密碼）")
         return False
     log("✅ 帳密登入成功，已到 dashboard")
+    _set_login_error("")
     return True
 
 
@@ -461,6 +524,7 @@ def ensure_session(page, cookies, email="", password=""):
 
     if not (email and password):
         log("❌ 冇帳密可用，而 cookie 又已失效")
+        _set_login_error("cookie 失效且冇帳密後備")
         return False
     return login_with_password(page, email, password)
 
@@ -737,7 +801,8 @@ def renew_account_via_browser(service_ids, cookies, email='', password='', shot_
                 except Exception:
                     pass
                 return {'services': [{'id': sid or '?', 'status': 'bad',
-                                      'detail': '登入唔到（cookie 失效且冇可用帳密）',
+                                      'detail': LAST_LOGIN_ERROR
+                                                or '登入唔到（cookie 失效且冇可用帳密）',
                                       'due_before': '', 'due_after': ''} for sid in (service_ids or ['?'])],
                         'shots': all_shots}
 
