@@ -635,19 +635,99 @@ def _renew_one_in_session(page, service_id, shot_prefix='hc'):
         log(f"📆 續期前到期: {due_before or '（抽唔到）'}")
 
         # ---- 撳 Renew 打開 modal ----
+        # 2026-10-11 重寫（按第三方實作 idakcl/hidencloud-cookie 的 renew_browser.py 路線）：
+        # 原版用 `page.locator(...).first.click()` 再靠「Create Invoice」文字／Turnstile 框判 modal；
+        # 實測 10-11 run 38127831822 連撳 6 次都報「modal 未出現」→ 假紅。
+        # 真相（idakcl 實證 log「还剩 4 天到期，需 <1 天才可续」）：未到窗口時站方**唔係唔彈**，
+        # 而係彈一個 `.fixed.inset-0 h3 = "Renewal Restricted"` 嘅 dialog；而且窗口係
+        # 「剩 <1 天」先開。所以要：① JS 直接 click（優先 onclick 含 showRenewAlert）
+        # ② 先認拒絕 dialog → 判 skip（唔好當 bad）③ modal 容器用真 ID
+        # `div#renewService-{sid}` / `form#renew-form-{sid}` ④ 失敗時 dump 所有掣。
         log("🖱️ 準備點擊 Renew…")
-        renew_btn = page.locator('button[onclick*="showRenewAlert"], button:has-text("Renew")').first
         create_btn = page.locator('button:has-text("Create Invoice")')
 
-        modal_opened = False
-        for i in range(6):
+        def _click_renew_js():
+            return page.evaluate("""() => {
+                const norm = t => (t || '').replace(/\\s+/g, ' ').trim();
+                const els = Array.from(document.querySelectorAll('button, a[href], input[type=submit]'));
+                let el = els.find(e => (e.getAttribute('onclick') || '').includes('showRenewAlert'));
+                if (!el) el = els.find(e => /renew/i.test(norm(e.textContent)) || /renew/i.test(norm(e.value)));
+                if (!el) return null;
+                el.scrollIntoView({block: 'center'});
+                el.click();
+                return norm(el.textContent || el.value).slice(0, 40);
+            }""")
+
+        def _restriction_dialog():
             try:
-                renew_btn.wait_for(state="visible", timeout=10000)
-                renew_btn.scroll_into_view_if_needed(timeout=5000)
-                log(f"🖱️ 第 {i + 1} 次點擊 Renew...")
-                renew_btn.click(timeout=10000)
+                return page.evaluate("""() => {
+                    const h = document.querySelector('.fixed.inset-0 h3');
+                    if (!h) return '';
+                    const p = document.querySelector('.fixed.inset-0 p');
+                    return (h.textContent || '').trim() + ' || ' +
+                           ((p && p.textContent) || '').replace(/\\s+/g, ' ').trim();
+                }""") or ""
+            except Exception:
+                return ""
+
+        def _renew_container():
+            for sel in (f"div#renewService-{service_id}", f"form#renew-form-{service_id}",
+                        f"#renew-form-{service_id}"):
+                try:
+                    if page.locator(sel).count():
+                        return sel
+                except Exception:
+                    continue
+            return ""
+
+        def _dump_buttons():
+            try:
+                els = page.evaluate("""() => Array.from(
+                    document.querySelectorAll('button, a[role=button], input[type=submit]')
+                ).map(e => ({
+                    tag: e.tagName.toLowerCase(),
+                    text: ((e.innerText || e.value || '').replace(/\\s+/g, ' ').trim()).slice(0, 40),
+                    onclick: (e.getAttribute('onclick') || '').slice(0, 60),
+                    id: e.id || '',
+                    visible: !!(e.offsetWidth || e.offsetHeight)
+                }))""")
+                log(f"   [DUMP] 共 {len(els)} 個掣：")
+                for e in els[:25]:
+                    log(f"   [DUMP]   {e}")
+            except Exception as e:
+                log(f"   [DUMP] 失敗: {e}")
+
+        modal_opened = False
+        for i in range(4):
+            try:
+                clicked = _click_renew_js()
+                if not clicked:
+                    log("⚠️ JS 掃描搵唔到 Renew 掣")
+                    _dump_buttons()
+                    break
+                log(f"🖱️ 第 {i + 1} 次點擊 Renew（JS）: {clicked!r}")
 
                 time.sleep(2)
+                # ① 先認站方拒絕 dialog —— 10-11 假紅嘅真因就係漏咗呢步
+                rtext = _restriction_dialog()
+                if rtext:
+                    log(f"📩 站方 dialog: {rtext[:160]}")
+                    if "renewal restricted" in rtext.lower() or "can only renew" in rtext.lower():
+                        dm = re.search(r"expires in\s+(\d+)\s+day", rtext, re.I)
+                        try:
+                            page.evaluate("""() => {
+                                const b = Array.from(document.querySelectorAll('button'))
+                                    .find(x => /ok|close|fermer/i.test(x.textContent || ''));
+                                if (b) b.click();
+                            }""")
+                        except Exception:
+                            pass
+                        detail = (f'未到續期窗口（站方：還剩 {dm.group(1)} 天，需 <1 天才可續）'
+                                  if dm else f'未到續期窗口（站方：{rtext[:80]}）')
+                        shot("renew_not_allowed")
+                        return {'status': 'skip', 'detail': detail,
+                                'due_before': due_before, 'due_after': due_before, 'shots': shots}
+
                 page_text = page.locator("body").inner_text(timeout=10000)
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
                     shot("renew_not_allowed")
@@ -659,13 +739,18 @@ def _renew_one_in_session(page, service_id, shot_prefix='hc'):
                     return {'status': 'bad', 'detail': err,
                             'due_before': due_before, 'due_after': due_before, 'shots': shots}
 
+                # ③ modal 容器用真 ID
+                cont = _renew_container()
+                if cont:
+                    modal_opened = True
+                    log(f"✅ modal 已彈出（容器 {cont}）")
+                    break
                 try:
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
                     log("✅ modal 已彈出（見 Create Invoice）")
                     break
                 except Exception:
-                    # modal 可能先出 Turnstile，Create Invoice 稍後先出現
                     if challenge_boxes(page):
                         modal_opened = True
                         log("✅ modal 已彈出（先出 Turnstile）")
@@ -677,7 +762,8 @@ def _renew_one_in_session(page, service_id, shot_prefix='hc'):
 
         if not modal_opened:
             shot("modal_failed")
-            return {'status': 'bad', 'detail': '撳 Renew 後 modal 彈唔出',
+            _dump_buttons()
+            return {'status': 'bad', 'detail': '撳 Renew 後 modal 彈唔出（已 dump 所有掣）',
                     'due_before': due_before, 'due_after': due_before, 'shots': shots}
 
         # ---- modal 內 Turnstile ----
