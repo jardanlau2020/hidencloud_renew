@@ -577,6 +577,37 @@ def _server_error_text(page):
 
 # ============================ 主流程 ============================
 
+def _account_gate(page):
+    r"""偵測站方「限制／需驗證」頁（2026-10-16 新增）。
+
+    實測 run 38869399535：`/dashboard` 被重定向到
+    `/account-verification?type=multiaccounts`，title「Account Verification Required
+    - HidenCloud」，正文「**Multi-Account Detection** — Your account has been
+    restricted due to the detection of multiple accounts. To regain access … you
+    must verify your account.」＋〔Verify Account〕〔Delete Account〕。
+
+    呢種係真・需人手處理（同 NeoHeberg TOS 停權、Lunes 停權同型），
+    唔可以靜靜當 skip —— 要標紅 + 講清楚。
+    """
+    try:
+        url = page.url or ''
+        title = page.title() or ''
+    except Exception:
+        return ''
+    if 'account-verification' not in url and 'account verification' not in title.lower():
+        return ''
+    detail = ''
+    try:
+        body = page.inner_text('body')[:600]
+        m = re.search(r'(Multi-Account Detection[^\n]{0,120}'
+                      r'|Your account has been restricted[^\n]{0,160})', body, re.I)
+        if m:
+            detail = re.sub(r'\s+', ' ', m.group(1)).strip()
+    except Exception:
+        pass
+    return detail or 'Account Verification Required'
+
+
 def discover_service_ids(page, shot_prefix='hc'):
     r"""由 dashboard HTML 抽服務 ID（HTTP cookie 死咗都唔影響，browser 自己睇）
 
@@ -933,8 +964,17 @@ def renew_account_via_browser(service_ids, cookies, email='', password='', shot_
             if not ids:
                 ids = discover_service_ids(page, shot_prefix)
             if not ids:
-                # 2026-10-16：搵唔到服務清單屬「環境／頁面狀態」問題，唔應該標紅
-                # （舊碼判 'bad'，加埋幽靈服務就變 51 條紅單）。
+                # 2026-10-16：搵唔到服務清單要分兩種 ——
+                # ① 站方限制／要求驗證（account-verification / Multi-Account Detection）
+                #    → 真・需人手處理，標紅講清楚（實測 run 38869399535）。
+                # ② 其他（頁面未 render／標記改咗）→ 環境性，判 skip 唔標紅。
+                gate = _account_gate(page)
+                if gate:
+                    return {'services': [{'id': '?', 'status': 'bad',
+                                          'detail': f'⛔ 帳號被站方限制：{gate}'
+                                                    f' —— 續期已停擺，需人手處理',
+                                          'due_before': '', 'due_after': ''}],
+                            'shots': all_shots}
                 return {'services': [{'id': '?', 'status': 'skip',
                                       'detail': '搵唔到服務清單（dashboard 可能未 render／'
                                                 '站方改咗標記），已截圖留證，下輪自動重試',

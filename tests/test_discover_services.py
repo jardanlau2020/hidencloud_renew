@@ -97,6 +97,29 @@ def test_slow_render_recovered_by_reload():
     assert page.reloads == 1
 
 
+class FakeGatePage(FakePage):
+    """模擬 10-16 實測：/dashboard 被重定向到帳號驗證頁。"""
+
+    def __init__(self):
+        super().__init__("<html><body>Multi-Account Detection</body></html>")
+        self.url = "https://dash.hidencloud.com/account-verification?type=multiaccounts"
+
+    def title(self):
+        return "Account Verification Required - HidenCloud"
+
+    def inner_text(self, sel=None):
+        return ("Multi-Account Detection\nYour account has been restricted due to the "
+                "detection of multiple accounts. To regain access to our platform, you "
+                "must verify your account.")
+
+
+def test_account_gate_detected():
+    page = FakeGatePage()
+    gate = hc_browser._account_gate(page)
+    assert gate, "應該認出帳號驗證頁"
+    assert "Multi-Account" in gate, gate
+
+
 def test_real_service_found_immediately():
     page = FakePage(DASHBOARD_HTML)
     ids = hc_browser.discover_service_ids(page, "t")
