@@ -578,20 +578,57 @@ def _server_error_text(page):
 # ============================ 主流程 ============================
 
 def discover_service_ids(page, shot_prefix='hc'):
-    """由 dashboard HTML 抽服務 ID（HTTP cookie 死咗都唔影響，browser 自己睇）"""
+    r"""由 dashboard HTML 抽服務 ID（HTTP cookie 死咗都唔影響，browser 自己睇）
+
+    2026-10-16 修（run 38867592042 教訓）：
+    ① 服務清單係 JS 後渲染 —— 舊碼 DOMContentLoaded 後即讀，攞到空殼就零收穫。
+       實測當日就係咁（login 成功、Turnstile 全過，但主 regex 搵唔到任何連結）。
+       改為先等 `a[href*="/service/"]` 真係出現（等唔到就 reload 一次再等）。
+    ② 刪走 `#(\d{4,})` 兜底 —— 佢會掃到 CSS 顏色碼（292524/737373/525252/404040/
+       0284/0891/059669/047857/075985… Tailwind 色板），一次過變出 51 個幽靈服務，
+       逐個去 /service/<hex>/manage 撞 404 → 51 條「modal 彈唔出」假紅。
+    ③ 零收穫時留現場證據（URL / title / href 樣本 / 截圖），下次一眼睇得出係
+       「頁未 render」定「站方改咗標記」。
+    """
     try:
         page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
         solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8,
                         shot_on_timeout=f"{shot_prefix}_discover.png")
-        html = page.content()
+        html = ""
+        for attempt in (1, 2):
+            try:
+                page.wait_for_selector('a[href*="/service/"]', timeout=20000)
+            except Exception as e:
+                log(f"⚠️ 等服務連結超時（第 {attempt} 次）: {str(e)[:80]}")
+            html = page.content()
+            if re.search(r'/service/(\d+)/manage', html):
+                break
+            if attempt == 1:
+                log("🔁 未見服務連結，reload 一次再等…")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    log(f"⚠️ reload 失敗: {str(e)[:80]}")
+                solve_turnstile(page, timeout=90, success_check=page_ready,
+                                reload_after=8, shot_on_timeout=f"{shot_prefix}_discover.png")
+
         ids = []
         for sid in re.findall(r'/service/(\d+)/manage', html):
             if sid not in ids:
                 ids.append(sid)
         if not ids:
-            for sid in re.findall(r'#(\d{4,})', html):
-                if sid not in ids:
-                    ids.append(sid)
+            try:
+                log(f"⚠️ 主 regex 零收穫 —— url={page.url!r} title={page.title()!r} "
+                    f"html={len(html)} 字")
+                log(f"   [DOM] href 樣本: {re.findall(chr(34) + 'href=' + chr(34) + '([^' + chr(34) + ']{0,70})' + chr(34), html)[:12]}")
+            except Exception:
+                pass
+            try:
+                _p = f"{shot_prefix}_discover_empty.png"
+                page.screenshot(path=_p)
+                log(f"📸 截圖: {_p}")
+            except Exception:
+                pass
         log(f"🔎 瀏覽器發現服務: {ids or '（冇）'}")
         return ids
     except Exception as e:
@@ -896,8 +933,11 @@ def renew_account_via_browser(service_ids, cookies, email='', password='', shot_
             if not ids:
                 ids = discover_service_ids(page, shot_prefix)
             if not ids:
-                return {'services': [{'id': '?', 'status': 'bad',
-                                      'detail': '搵唔到任何服務',
+                # 2026-10-16：搵唔到服務清單屬「環境／頁面狀態」問題，唔應該標紅
+                # （舊碼判 'bad'，加埋幽靈服務就變 51 條紅單）。
+                return {'services': [{'id': '?', 'status': 'skip',
+                                      'detail': '搵唔到服務清單（dashboard 可能未 render／'
+                                                '站方改咗標記），已截圖留證，下輪自動重試',
                                       'due_before': '', 'due_after': ''}],
                         'shots': all_shots}
 
